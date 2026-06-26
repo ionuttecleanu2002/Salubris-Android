@@ -3,8 +3,6 @@ package com.example.salubris.ui.screens.pages
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.os.Bundle
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
@@ -35,10 +33,9 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.HourglassEmpty
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Link
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
@@ -76,9 +73,9 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.salubris.database.entities.MealWithProducts
-import com.example.salubris.database.entities.Product
-import com.example.salubris.database.relations.ProductWithQuantity
+import com.example.salubris.database.entities.MealComponent
+import com.example.salubris.database.entities.ProductEntity
+import com.example.salubris.database.viewmodels.MealUI
 import com.example.salubris.database.viewmodels.MealViewModel
 import com.example.salubris.database.viewmodels.ProductViewModel
 import com.example.salubris.database.viewmodels.mealViewModelFactory
@@ -95,22 +92,10 @@ import com.example.salubris.ui.theme.proteinColor
 import com.example.salubris.ui.theme.submitColor
 import com.example.salubris.utils.ProductNutritionLabel
 import com.example.salubris.utils.Vocabulary
-import com.example.salubris.utils.calculateMacrosForProduct
 import com.example.salubris.utils.truncate2Decimals
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
-
-// Helper beep function (top level)
-private fun playBeep() {
-    try {
-        val tone = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
-        tone.startTone(ToneGenerator.TONE_PROP_BEEP, 100)
-        tone.release()
-    } catch (e: Exception) {
-        e.printStackTrace()
-    }
-}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -122,18 +107,23 @@ fun Meals() {
     val mealViewModel: MealViewModel = viewModel(factory = mealViewModelFactory(context))
 
     val products by productViewModel.products.collectAsStateWithLifecycle()
-    val mealsWithProducts by mealViewModel.mealsWithProducts.collectAsStateWithLifecycle()
+    val meals by mealViewModel.meals.collectAsStateWithLifecycle()
     val isLoading by mealViewModel.isLoading.collectAsStateWithLifecycle()
 
     // Normal add meal modal state
     var isOpen by remember { mutableStateOf(false) }
     var mealName by remember { mutableStateOf("") }
-    val selectedProducts = remember { mutableStateListOf<ProductWithQuantity>() }
+    val selectedComponents = remember { mutableStateListOf<MealComponent>() }
 
     // Hands‑free modal state
     var isHandsFreeOpen by remember { mutableStateOf(false) }
-    val handsFreeProducts = remember { mutableStateListOf<ProductWithQuantity>() }
+    val handsFreeComponents = remember { mutableStateListOf<MealComponent>() }
     val draftProducts = remember { mutableStateListOf<DraftProduct>() }
+
+    // Edit meal state
+    var editingMealUI by remember { mutableStateOf<MealUI?>(null) }
+    var editComponents = remember { mutableStateListOf<MealComponent>() }
+    var editName by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         mealViewModel.loadData()
@@ -191,16 +181,22 @@ fun Meals() {
             ) {
                 if (isLoading) {
                     Text(Vocabulary.get().loading, color = Color.Gray)
-                } else if (mealsWithProducts.isEmpty()) {
+                } else if (meals.isEmpty()) {
                     Text(Vocabulary.get().noMealsYet, color = Color.Gray)
                 } else {
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        items(mealsWithProducts) { mealWithProducts ->
+                        items(meals) { mealUI ->
                             MealItem(
-                                mealWithProducts = mealWithProducts,
+                                mealUI = mealUI,
+                                onEdit = {
+                                    editingMealUI = mealUI
+                                    editName = mealUI.meal.name
+                                    editComponents.clear()
+                                    editComponents.addAll(mealUI.components)
+                                },
                                 onDelete = {
                                     scope.launch {
-                                        mealViewModel.deleteMeal(mealWithProducts.meal)
+                                        mealViewModel.deleteMeal(mealUI.meal)
                                     }
                                 }
                             )
@@ -258,20 +254,20 @@ fun Meals() {
                             }
                             NormalAddMealContent(
                                 products = products,
-                                selectedProducts = selectedProducts,
+                                selectedComponents = selectedComponents,
                                 mealName = mealName,
                                 onMealNameChange = { mealName = it },
                                 productViewModel = productViewModel,
                                 onSave = {
-                                    if (mealName.isNotBlank() && selectedProducts.isNotEmpty()) {
+                                    if (mealName.isNotBlank() && selectedComponents.isNotEmpty()) {
                                         scope.launch {
                                             mealViewModel.addMeal(
                                                 mealName,
-                                                selectedProducts.toList()
+                                                selectedComponents.toList()
                                             )
                                             isOpen = false
                                             mealName = ""
-                                            selectedProducts.clear()
+                                            selectedComponents.clear()
                                         }
                                     }
                                 }
@@ -282,7 +278,80 @@ fun Meals() {
             }
         }
 
-        // Hands‑free dialog (continuous listening) – bigger with scroll
+        // Edit meal dialog
+        editingMealUI?.let { mealUI ->
+            Dialog(
+                onDismissRequest = { editingMealUI = null },
+                properties = DialogProperties(usePlatformDefaultWidth = false)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.7f))
+                        .clickable { editingMealUI = null },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth(0.95f)
+                            .wrapContentHeight()
+                            .clickable { }
+                            .background(Color(30, 30, 30), shape = RoundedCornerShape(24.dp)),
+                        shape = RoundedCornerShape(24.dp),
+                        colors = CardDefaults.cardColors(containerColor = Color(30, 30, 30)),
+                        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(16.dp),
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    "Edit Meal",
+                                    color = Color.White,
+                                    fontSize = 20.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                IconButton(onClick = { editingMealUI = null }) {
+                                    Icon(
+                                        Icons.Default.Close,
+                                        contentDescription = Vocabulary.get().close,
+                                        tint = Color.White
+                                    )
+                                }
+                            }
+                            NormalAddMealContent(
+                                products = products,
+                                selectedComponents = editComponents,
+                                mealName = editName,
+                                onMealNameChange = { editName = it },
+                                productViewModel = productViewModel,
+                                onSave = {
+                                    if (editName.isNotBlank() && editComponents.isNotEmpty()) {
+                                        scope.launch {
+                                            mealViewModel.updateMeal(
+                                                mealUI.meal.uid,
+                                                editName,
+                                                editComponents.toList()
+                                            )
+                                            editingMealUI = null
+                                            editComponents.clear()
+                                            editName = ""
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        // Hands‑free dialog
         if (isHandsFreeOpen) {
             Dialog(
                 onDismissRequest = { isHandsFreeOpen = false },
@@ -333,18 +402,18 @@ fun Meals() {
                             HandsFreeMealContent(
                                 isOpen = isHandsFreeOpen,
                                 products = products,
-                                initialHandsFreeProducts = handsFreeProducts,
+                                initialHandsFreeComponents = handsFreeComponents,
                                 initialDraftProducts = draftProducts,
                                 onClose = {
                                     isHandsFreeOpen = false
-                                    handsFreeProducts.clear()
+                                    handsFreeComponents.clear()
                                     draftProducts.clear()
                                 },
-                                onSave = { name, finalProducts ->
+                                onSave = { name, finalComponents ->
                                     scope.launch {
-                                        mealViewModel.addMeal(name, finalProducts)
+                                        mealViewModel.addMeal(name, finalComponents)
                                         isHandsFreeOpen = false
-                                        handsFreeProducts.clear()
+                                        handsFreeComponents.clear()
                                         draftProducts.clear()
                                     }
                                 },
@@ -359,22 +428,23 @@ fun Meals() {
 }
 
 // ============================================================
-// MealItem
+// MealItem – with edit support and draft badge
 // ============================================================
 @Composable
-fun MealItem(mealWithProducts: MealWithProducts, onDelete: () -> Unit) {
-    val totalWeight = mealWithProducts.products.sumOf { it.quantity.toDouble() }.toFloat()
+fun MealItem(mealUI: MealUI, onEdit: () -> Unit, onDelete: () -> Unit) {
+    val hasDrafts = mealUI.components.any { it.isDraft }
+    val totalWeight = mealUI.components.sumOf { it.quantity.toDouble() }.toFloat()
     var totalCalories = 0f
     var totalProtein = 0f
     var totalCarbs = 0f
     var totalFats = 0f
 
-    mealWithProducts.products.forEach { productWithQty ->
-        val macros = calculateMacrosForProduct(productWithQty.product, productWithQty.quantity)
-        totalCalories += macros["calories"] ?: 0f
-        totalProtein += macros["protein"] ?: 0f
-        totalCarbs += macros["carbs"] ?: 0f
-        totalFats += macros["fats"] ?: 0f
+    mealUI.components.forEach { comp ->
+        val factor = comp.quantity / 100f
+        totalCalories += comp.calories * factor
+        totalProtein += comp.protein * factor
+        totalCarbs += comp.carbs * factor
+        totalFats += comp.fats * factor
     }
 
     val per100Calories = if (totalWeight > 0) (totalCalories / totalWeight) * 100 else 0f
@@ -385,7 +455,11 @@ fun MealItem(mealWithProducts: MealWithProducts, onDelete: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Color(60, 60, 60), RoundedCornerShape(5.dp))
+            .background(
+                if (hasDrafts) Color(0xFF3D2B1F) else Color(60, 60, 60),
+                RoundedCornerShape(5.dp)
+            )
+            .clickable { onEdit() }
             .padding(8.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
@@ -394,14 +468,20 @@ fun MealItem(mealWithProducts: MealWithProducts, onDelete: () -> Unit) {
             verticalArrangement = Arrangement.spacedBy(4.dp),
             modifier = Modifier.weight(1f)
         ) {
-            Text(
-                mealWithProducts.meal.name,
-                fontWeight = FontWeight.Bold,
-                color = Color.White,
-                fontSize = 20.sp
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    mealUI.meal.name,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    fontSize = 20.sp
+                )
+                if (hasDrafts) {
+                    Spacer(Modifier.width(8.dp))
+                    Text("⚠️", fontSize = 16.sp)
+                }
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                val ingredientCount = mealWithProducts.products.size
+                val ingredientCount = mealUI.components.size
                 Text(
                     if (ingredientCount == 1) {
                         "${ingredientCount} ${Vocabulary.get().ingredients}"
@@ -432,7 +512,13 @@ fun MealItem(mealWithProducts: MealWithProducts, onDelete: () -> Unit) {
                 Text("C: ${per100Carbs.truncate2Decimals()}", color = carbsColor, fontSize = 14.sp)
                 Text("F: ${per100Fats.truncate2Decimals()}", color = fatsColor, fontSize = 14.sp)
             }
-            Text(Vocabulary.get().per100g, color = Color.White.copy(alpha = 0.5f), fontSize = 10.sp)
+            if (hasDrafts) {
+                Text(
+                    "Contains unresolved products – edit to resolve",
+                    color = Color.Yellow,
+                    fontSize = 11.sp
+                )
+            }
         }
         IconButton(
             onClick = onDelete,
@@ -454,19 +540,28 @@ fun MealItem(mealWithProducts: MealWithProducts, onDelete: () -> Unit) {
 }
 
 // ============================================================
-// NormalAddMealContent
+// NormalAddMealContent – reusable for add and edit
+// Now supports editing existing components (click to edit)
 // ============================================================
 @Composable
 private fun NormalAddMealContent(
-    products: List<Product>,
-    selectedProducts: MutableList<ProductWithQuantity>,
+    products: List<ProductEntity>,
+    selectedComponents: MutableList<MealComponent>,
     mealName: String,
     onMealNameChange: (String) -> Unit,
     productViewModel: ProductViewModel,
     onSave: () -> Unit
 ) {
-    var selectedProduct by remember { mutableStateOf<Product?>(null) }
+    var selectedProduct by remember { mutableStateOf<ProductEntity?>(null) }
     var quantityInput by remember { mutableStateOf("100") }
+    var editingIndex by remember { mutableStateOf<Int?>(null) }
+    var resolvingDraftIndex by remember { mutableStateOf<Int?>(null) }
+
+    fun resetForm() {
+        editingIndex = null
+        selectedProduct = null
+        quantityInput = "100"
+    }
 
     Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
         Input(
@@ -476,7 +571,8 @@ private fun NormalAddMealContent(
             keyboardType = KeyboardType.Text
         )
         Text(Vocabulary.get().products, fontWeight = FontWeight.Bold, color = Color.White)
-        selectedProducts.forEachIndexed { index, productWithQty ->
+
+        selectedComponents.forEachIndexed { index, comp ->
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -486,27 +582,64 @@ private fun NormalAddMealContent(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            comp.productName,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White
+                        )
+                        if (comp.isDraft) {
+                            Spacer(Modifier.width(6.dp))
+                            Text("⚠️", fontSize = 14.sp)
+                        }
+                    }
                     Text(
-                        productWithQty.product.name,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White
-                    )
-                    Text(
-                        "${Vocabulary.get().quantityLabel} ${productWithQty.quantity}g",
+                        "${Vocabulary.get().quantityLabel} ${comp.quantity}g",
                         fontSize = 14.sp,
                         color = Color.White.copy(alpha = 0.7f)
                     )
                 }
-                IconButton(onClick = { selectedProducts.removeAt(index) }) {
-                    Icon(
-                        Icons.Default.Delete,
-                        Vocabulary.get().remove,
-                        tint = cancelColor,
-                        modifier = Modifier.size(24.dp)
-                    )
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (comp.isDraft) {
+                        Button(
+                            onClick = { resolvingDraftIndex = index },
+                            colors = ButtonDefaults.buttonColors(containerColor = productColor),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Resolve", color = Color.White, fontSize = 12.sp)
+                        }
+                    } else {
+                        IconButton(
+                            onClick = {
+                                editingIndex = index
+                                selectedProduct = products.find { it.uid == comp.resolvedProductId }
+                                quantityInput = comp.quantity.toString()
+                            },
+                            modifier = Modifier.size(32.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Edit,
+                                contentDescription = "Edit",
+                                tint = productColor,
+                                modifier = Modifier.size(18.dp)
+                            )
+                        }
+                    }
+                    IconButton(
+                        onClick = { selectedComponents.removeAt(index) },
+                        modifier = Modifier.size(32.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Delete,
+                            Vocabulary.get().remove,
+                            tint = cancelColor,
+                            modifier = Modifier.size(20.dp)
+                        )
+                    }
                 }
             }
         }
+
         FilterableDropdown(
             options = products,
             selectedItem = selectedProduct,
@@ -524,47 +657,130 @@ private fun NormalAddMealContent(
         if (selectedProduct != null) {
             ProductNutritionLabel(selectedProduct!!)
         }
-        Button(
-            onClick = {
-                val qty = quantityInput.toFloatOrNull()
-                if (selectedProduct != null && qty != null && qty > 0) {
-                    selectedProducts.add(ProductWithQuantity(selectedProduct!!, qty))
-                    selectedProduct = null
-                    quantityInput = "100"
-                }
-            },
-            enabled = selectedProduct != null && quantityInput.toFloatOrNull() != null,
+
+        Row(
             modifier = Modifier.fillMaxWidth(),
-            colors = ButtonDefaults.buttonColors(containerColor = productColor)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Text(Vocabulary.get().addProductButton, color = Color.White)
+            if (editingIndex != null) {
+                Button(
+                    onClick = {
+                        val qty = quantityInput.toFloatOrNull()
+                        if (selectedProduct != null && qty != null && qty > 0) {
+                            val newComp = MealComponent(
+                                productName = selectedProduct!!.name,
+                                calories = selectedProduct!!.calories,
+                                protein = selectedProduct!!.protein,
+                                carbs = selectedProduct!!.carbs,
+                                fats = selectedProduct!!.fats,
+                                quantity = qty,
+                                resolvedProductId = selectedProduct!!.uid,
+                                isDraft = false
+                            )
+                            selectedComponents[editingIndex!!] = newComp
+                            resetForm()
+                        }
+                    },
+                    enabled = selectedProduct != null && quantityInput.toFloatOrNull() != null,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(containerColor = productColor)
+                ) {
+                    Text("Update", color = Color.White)
+                }
+                Button(
+                    onClick = { resetForm() },  // ✅ fixed: explicit lambda
+                    colors = ButtonDefaults.buttonColors(containerColor = cancelColor),
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("Cancel", color = Color.White)
+                }
+            } else {
+                Button(
+                    onClick = {
+                        val qty = quantityInput.toFloatOrNull()
+                        if (selectedProduct != null && qty != null && qty > 0) {
+                            selectedComponents.add(
+                                MealComponent(
+                                    productName = selectedProduct!!.name,
+                                    calories = selectedProduct!!.calories,
+                                    protein = selectedProduct!!.protein,
+                                    carbs = selectedProduct!!.carbs,
+                                    fats = selectedProduct!!.fats,
+                                    quantity = qty,
+                                    resolvedProductId = selectedProduct!!.uid,
+                                    isDraft = false
+                                )
+                            )
+                            selectedProduct = null
+                            quantityInput = "100"
+                        }
+                    },
+                    enabled = selectedProduct != null && quantityInput.toFloatOrNull() != null,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.buttonColors(containerColor = productColor)
+                ) {
+                    Text(Vocabulary.get().addProductButton, color = Color.White)
+                }
+            }
         }
+
         Button(
             onClick = onSave,
-            enabled = mealName.isNotBlank() && selectedProducts.isNotEmpty(),
+            enabled = mealName.isNotBlank() && selectedComponents.isNotEmpty(),
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = submitColor)
         ) {
             Text(Vocabulary.get().saveMeal, color = Color.White)
         }
     }
+
+    if (resolvingDraftIndex != null) {
+        val comp = selectedComponents[resolvingDraftIndex!!]
+        val draft = DraftProduct(
+            name = comp.productName,
+            quantity = comp.quantity,
+            resolvedProduct = null
+        )
+        ResolveDraftDialog(
+            draft = draft,
+            products = products,
+            productViewModel = productViewModel,
+            onResolved = { resolvedProduct ->
+                val newComp = MealComponent(
+                    productName = resolvedProduct.name,
+                    calories = resolvedProduct.calories,
+                    protein = resolvedProduct.protein,
+                    carbs = resolvedProduct.carbs,
+                    fats = resolvedProduct.fats,
+                    quantity = draft.quantity,
+                    resolvedProductId = resolvedProduct.uid,
+                    isDraft = false
+                )
+                selectedComponents[resolvingDraftIndex!!] = newComp
+                resolvingDraftIndex = null
+            },
+            onDismiss = { resolvingDraftIndex = null }
+        )
+    }
 }
 
 data class DraftProduct(
     val name: String,
     val quantity: Float,
-    var resolvedProduct: Product? = null
+    var resolvedProduct: ProductEntity? = null
 )
 
-
+// ============================================================
+// HandsFreeMealContent – single combined list with resolve
+// ============================================================
 @Composable
 fun HandsFreeMealContent(
     isOpen: Boolean,
-    products: List<Product>,
-    initialHandsFreeProducts: MutableList<ProductWithQuantity>,
+    products: List<ProductEntity>,
+    initialHandsFreeComponents: MutableList<MealComponent>,
     initialDraftProducts: MutableList<DraftProduct>,
     onClose: () -> Unit,
-    onSave: (String, List<ProductWithQuantity>) -> Unit,
+    onSave: (String, List<MealComponent>) -> Unit,
     productViewModel: ProductViewModel
 ) {
     val context = LocalContext.current
@@ -574,9 +790,7 @@ fun HandsFreeMealContent(
     var speechRecognizer: SpeechRecognizer? by remember { mutableStateOf(null) }
     var recognitionStatus by remember { mutableStateOf(Vocabulary.get().ready) }
     var permissionGranted by remember { mutableStateOf(false) }
-    var isRestarting by remember { mutableStateOf(false) }
 
-    // State to control which draft is being resolved
     var resolvingDraftIndex by remember { mutableStateOf<Int?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
@@ -627,20 +841,41 @@ fun HandsFreeMealContent(
         }
         val existing = products.find { it.name.equals(productName, ignoreCase = true) }
         if (existing != null) {
-            initialHandsFreeProducts.add(ProductWithQuantity(existing, quantity))
+            initialHandsFreeComponents.add(
+                MealComponent(
+                    productName = existing.name,
+                    calories = existing.calories,
+                    protein = existing.protein,
+                    carbs = existing.carbs,
+                    fats = existing.fats,
+                    quantity = quantity,
+                    resolvedProductId = existing.uid,
+                    isDraft = false
+                )
+            )
             recognitionStatus =
                 Vocabulary.get().addedProduct.replace("{quantity}", quantity.toString())
                     .replace("{product}", existing.name)
         } else {
-            val draft = DraftProduct(productName, quantity)
-            initialDraftProducts.add(draft)
+            initialHandsFreeComponents.add(
+                MealComponent(
+                    productName = productName,
+                    calories = 0f,
+                    protein = 0f,
+                    carbs = 0f,
+                    fats = 0f,
+                    quantity = quantity,
+                    resolvedProductId = null,
+                    isDraft = true
+                )
+            )
             recognitionStatus =
                 Vocabulary.get().productNotFoundAddedDraft.replace("{product}", productName)
         }
     }
 
-    fun startContinuousListening() {
-        if (!permissionGranted || isRestarting) return
+    fun startListening() {
+        if (!permissionGranted) return
         if (speechRecognizer == null) {
             speechRecognizer = SpeechRecognizer.createSpeechRecognizer(context)
             speechRecognizer?.setRecognitionListener(object : RecognitionListener {
@@ -666,18 +901,16 @@ fun HandsFreeMealContent(
                         SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> Vocabulary.get().recognizerBusy
                         else -> Vocabulary.get().errorWithCode.replace("{error}", error.toString())
                     }
-                    // Restart after a short delay on error
-                    if (permissionGranted && isOpen && !isRestarting) {
+                    if (permissionGranted && isOpen) {
                         scope.launch {
-                            isRestarting = true
-                            delay(500) // small delay to avoid thrashing
-                            isRestarting = false
-                            startContinuousListening()
+                            delay(500)
+                            startListening()
                         }
                     }
                 }
 
                 override fun onResults(results: Bundle?) {
+                    isListening = false
                     val matches = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     val spoken = matches?.firstOrNull()
                     if (spoken != null) {
@@ -685,14 +918,10 @@ fun HandsFreeMealContent(
                     } else {
                         recognitionStatus = Vocabulary.get().couldNotUnderstand
                     }
-                    // Restart immediately after processing the result
-                    if (permissionGranted && isOpen && !isRestarting) {
+                    if (permissionGranted && isOpen) {
                         scope.launch {
-                            // Avoid overlapping restarts
-                            isRestarting = true
-                            // We don't need a delay; just start listening again
-                            startContinuousListening()
-                            isRestarting = false
+                            delay(500)
+                            startListening()
                         }
                     }
                 }
@@ -701,16 +930,17 @@ fun HandsFreeMealContent(
                 override fun onEvent(eventType: Int, params: Bundle?) {}
             })
         }
-        // Start listening
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(
-                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-            )
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-            putExtra(RecognizerIntent.EXTRA_PROMPT, Vocabulary.get().speechPrompt)
+        if (!isListening && permissionGranted) {
+            val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                putExtra(
+                    RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                    RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                )
+                putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
+                putExtra(RecognizerIntent.EXTRA_PROMPT, Vocabulary.get().speechPrompt)
+            }
+            speechRecognizer?.startListening(intent)
         }
-        speechRecognizer?.startListening(intent)
     }
 
     fun stopListening() {
@@ -720,49 +950,58 @@ fun HandsFreeMealContent(
         isListening = false
     }
 
-    // Start listening when the dialog opens and permission is granted
     LaunchedEffect(isOpen, permissionGranted) {
         if (isOpen && permissionGranted) {
-            startContinuousListening()
+            startListening()
         } else {
             stopListening()
         }
     }
 
-    // Clean up on disposal
     DisposableEffect(Unit) {
         onDispose { stopListening() }
     }
 
-    // Function to resolve a draft at a given index
-    fun resolveDraft(index: Int, resolvedProduct: Product) {
-        val draft = initialDraftProducts[index]
-        initialHandsFreeProducts.add(ProductWithQuantity(resolvedProduct, draft.quantity))
-        initialDraftProducts.removeAt(index)
+    fun resolveDraft(index: Int, resolvedProduct: ProductEntity) {
+        val comp = initialHandsFreeComponents[index]
+        val newComp = MealComponent(
+            productName = resolvedProduct.name,
+            calories = resolvedProduct.calories,
+            protein = resolvedProduct.protein,
+            carbs = resolvedProduct.carbs,
+            fats = resolvedProduct.fats,
+            quantity = comp.quantity,
+            resolvedProductId = resolvedProduct.uid,
+            isDraft = false
+        )
+        initialHandsFreeComponents[index] = newComp
         recognitionStatus =
             Vocabulary.get().resolvedProduct.replace("{product}", resolvedProduct.name)
+        if (permissionGranted && isOpen) {
+            scope.launch {
+                delay(500)
+                startListening()
+            }
+        }
     }
 
-    // Compute total macros for resolved products using map + sum
     val totalCalories =
-        initialHandsFreeProducts.map { (it.product.calories * it.quantity) / 100f }.sum()
+        initialHandsFreeComponents.map { (it.calories * it.quantity) / 100f }.sum()
     val totalProtein =
-        initialHandsFreeProducts.map { (it.product.protein * it.quantity) / 100f }.sum()
-    val totalCarbs = initialHandsFreeProducts.map { (it.product.carbs * it.quantity) / 100f }.sum()
-    val totalFats = initialHandsFreeProducts.map { (it.product.fats * it.quantity) / 100f }.sum()
-    val totalWeight = initialHandsFreeProducts.map { it.quantity }.sum()
+        initialHandsFreeComponents.map { (it.protein * it.quantity) / 100f }.sum()
+    val totalCarbs = initialHandsFreeComponents.map { (it.carbs * it.quantity) / 100f }.sum()
+    val totalFats = initialHandsFreeComponents.map { (it.fats * it.quantity) / 100f }.sum()
+    val totalWeight = initialHandsFreeComponents.map { it.quantity }.sum()
 
     Column(modifier = Modifier.padding(8.dp)) {
-        // Meal name input
         Input(
             label = Vocabulary.get().mealName,
             value = mealName,
             onChange = { mealName = it }
         )
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
-        // Status and listening indicator
         Row(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -781,50 +1020,72 @@ fun HandsFreeMealContent(
             )
         }
 
-        Spacer(Modifier.height(12.dp))
+        Spacer(modifier = Modifier.height(12.dp))
 
-        // Resolved products
         Row(verticalAlignment = Alignment.CenterVertically) {
             Icon(
-                Icons.Default.CheckCircle,
+                Icons.Default.Check,
                 contentDescription = Vocabulary.get().resolved,
                 tint = submitColor,
                 modifier = Modifier.size(20.dp)
             )
             Spacer(Modifier.width(6.dp))
             Text(
-                "${Vocabulary.get().addedProducts} (${initialHandsFreeProducts.size})",
+                "${Vocabulary.get().addedProducts} (${initialHandsFreeComponents.size})",
                 color = Color.White,
                 fontWeight = FontWeight.Bold
             )
         }
-        if (initialHandsFreeProducts.isEmpty()) {
+        if (initialHandsFreeComponents.isEmpty()) {
             Text(Vocabulary.get().noProductsAdded, color = Color.Gray, fontSize = 14.sp)
         } else {
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                initialHandsFreeProducts.forEachIndexed { index, p ->
+                initialHandsFreeComponents.forEachIndexed { index, p ->
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .background(Color(50, 50, 50), RoundedCornerShape(8.dp))
+                            .background(
+                                if (p.isDraft) Color(60, 40, 20) else Color(50, 50, 50),
+                                RoundedCornerShape(8.dp)
+                            )
                             .padding(8.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("${p.product.name} – ${p.quantity}g", color = Color.White)
-                        IconButton(
-                            onClick = { initialHandsFreeProducts.removeAt(index) },
-                            modifier = Modifier.size(32.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.Delete,
-                                contentDescription = Vocabulary.get().remove,
-                                tint = cancelColor
-                            )
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text("${p.productName} – ${p.quantity}g", color = Color.White)
+                            if (p.isDraft) {
+                                Spacer(Modifier.width(6.dp))
+                                Text("⚠️", fontSize = 14.sp)
+                            }
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            if (p.isDraft) {
+                                Button(
+                                    onClick = { resolvingDraftIndex = index },
+                                    colors = ButtonDefaults.buttonColors(containerColor = productColor),
+                                    contentPadding = PaddingValues(
+                                        horizontal = 8.dp,
+                                        vertical = 4.dp
+                                    )
+                                ) {
+                                    Text("Resolve", color = Color.White, fontSize = 12.sp)
+                                }
+                            }
+                            IconButton(
+                                onClick = { initialHandsFreeComponents.removeAt(index) },
+                                modifier = Modifier.size(32.dp)
+                            ) {
+                                Icon(
+                                    Icons.Default.Delete,
+                                    contentDescription = Vocabulary.get().remove,
+                                    tint = cancelColor,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                            }
                         }
                     }
                 }
-                // Show total macros
                 if (totalWeight > 0) {
                     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         Text(
@@ -862,66 +1123,7 @@ fun HandsFreeMealContent(
             }
         }
 
-        Spacer(Modifier.height(12.dp))
-
-        // Draft products
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Icon(
-                Icons.Default.HourglassEmpty,
-                contentDescription = Vocabulary.get().drafts,
-                tint = Color.Yellow,
-                modifier = Modifier.size(20.dp)
-            )
-            Spacer(Modifier.width(6.dp))
-            Text(
-                "${Vocabulary.get().draftProducts} (${initialDraftProducts.size})",
-                color = Color.Yellow,
-                fontWeight = FontWeight.Bold
-            )
-        }
-        if (initialDraftProducts.isEmpty()) {
-            Text(Vocabulary.get().noDrafts, color = Color.Gray, fontSize = 14.sp)
-        } else {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                initialDraftProducts.forEachIndexed { index, draft ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(Color(60, 40, 20), RoundedCornerShape(8.dp))
-                            .padding(8.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("${draft.name} – ${draft.quantity}g", color = Color.White)
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            Button(
-                                onClick = { resolvingDraftIndex = index },
-                                colors = ButtonDefaults.buttonColors(containerColor = productColor),
-                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
-                            ) {
-                                Text(
-                                    Vocabulary.get().resolve,
-                                    color = Color.White,
-                                    fontSize = 12.sp
-                                )
-                            }
-                            IconButton(
-                                onClick = { initialDraftProducts.removeAt(index) },
-                                modifier = Modifier.size(32.dp)
-                            ) {
-                                Icon(
-                                    Icons.Default.Close,
-                                    contentDescription = Vocabulary.get().removeDraft,
-                                    tint = Color.Red
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        Spacer(Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(16.dp))
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -940,24 +1142,23 @@ fun HandsFreeMealContent(
                         recognitionStatus = Vocabulary.get().pleaseEnterMealName
                         return@Button
                     }
-                    if (initialHandsFreeProducts.isEmpty() && initialDraftProducts.isEmpty()) {
-                        recognitionStatus = Vocabulary.get().addAtLeastOneProduct
-                        return@Button
-                    }
-                    // Save only resolved products for now; drafts are kept locally
-                    onSave(mealName, initialHandsFreeProducts.toList())
+                    onSave(mealName, initialHandsFreeComponents.toList())
                 },
                 colors = ButtonDefaults.buttonColors(containerColor = productColor),
                 modifier = Modifier.weight(1f),
-                enabled = mealName.isNotBlank() &&
-                        (initialHandsFreeProducts.isNotEmpty() || initialDraftProducts.isNotEmpty())
+                enabled = mealName.isNotBlank() && initialHandsFreeComponents.isNotEmpty()
             ) {
                 Text(Vocabulary.get().saveMeal)
             }
         }
 
         if (resolvingDraftIndex != null) {
-            val draft = initialDraftProducts[resolvingDraftIndex!!]
+            val comp = initialHandsFreeComponents[resolvingDraftIndex!!]
+            val draft = DraftProduct(
+                name = comp.productName,
+                quantity = comp.quantity,
+                resolvedProduct = null
+            )
             ResolveDraftDialog(
                 draft = draft,
                 products = products,
@@ -972,15 +1173,18 @@ fun HandsFreeMealContent(
     }
 }
 
+// ============================================================
+// ResolveDraftDialog – fixed theming
+// ============================================================
 @Composable
 private fun ResolveDraftDialog(
     draft: DraftProduct,
-    products: List<Product>,
+    products: List<ProductEntity>,
     productViewModel: ProductViewModel,
-    onResolved: (Product) -> Unit,
+    onResolved: (ProductEntity) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var selectedExistingProduct by remember { mutableStateOf<Product?>(null) }
+    var selectedExistingProduct by remember { mutableStateOf<ProductEntity?>(null) }
     var newProductName by remember { mutableStateOf(draft.name) }
     var newCalories by remember { mutableStateOf("") }
     var newProtein by remember { mutableStateOf("") }
@@ -990,6 +1194,7 @@ private fun ResolveDraftDialog(
 
     AlertDialog(
         onDismissRequest = onDismiss,
+        containerColor = ContainerBackground,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Icon(
@@ -1003,7 +1208,6 @@ private fun ResolveDraftDialog(
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                // Option 1: Map to existing
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         Icons.Default.Link,
@@ -1028,7 +1232,6 @@ private fun ResolveDraftDialog(
 
                 Divider(modifier = Modifier.padding(vertical = 4.dp), color = Color.Gray)
 
-                // Option 2: Create new product
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         Icons.Default.Add,
@@ -1096,7 +1299,7 @@ private fun ResolveDraftDialog(
                     val resolved = when {
                         selectedExistingProduct != null -> selectedExistingProduct!!
                         else -> {
-                            val product = Product(
+                            val product = ProductEntity(
                                 name = newProductName.ifBlank { draft.name },
                                 calories = newCalories.toFloatOrNull() ?: 0f,
                                 protein = newProtein.toFloatOrNull() ?: 0f,
@@ -1108,29 +1311,35 @@ private fun ResolveDraftDialog(
                         }
                     }
                     onResolved(resolved)
-                }
+                },
+                colors = ButtonDefaults.textButtonColors(contentColor = productColor)
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         Icons.Default.Check,
                         contentDescription = null,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(16.dp),
+                        tint = productColor
                     )
                     Spacer(Modifier.width(4.dp))
-                    Text(Vocabulary.get().confirm)
+                    Text(Vocabulary.get().confirm, color = Color.White)
                 }
             }
         },
         dismissButton = {
-            TextButton(onClick = onDismiss) {
+            TextButton(
+                onClick = onDismiss,
+                colors = ButtonDefaults.textButtonColors(contentColor = cancelColor)
+            ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
                         Icons.Default.Close,
                         contentDescription = null,
-                        modifier = Modifier.size(16.dp)
+                        modifier = Modifier.size(16.dp),
+                        tint = cancelColor
                     )
                     Spacer(Modifier.width(4.dp))
-                    Text(Vocabulary.get().cancel)
+                    Text(Vocabulary.get().cancel, color = Color.White)
                 }
             }
         }
